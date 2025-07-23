@@ -130,13 +130,11 @@ data "aws_vpc" "selected" {
     values = ["ets-dev-ci"]
   }
 }
-
-# Use the exact subnet IDs that your existing cluster is using
 locals {
   eks_subnet_ids = [
-    "subnet-03f452bb6f81bbe9c",
-    "subnet-0dc1f2ee57ec43d33", 
-    "subnet-0127c116bc56af264"
+    "subnet-xXx",
+    "subnet-xXx", 
+    "subnet-xXx"
   ]
 }
 
@@ -149,8 +147,6 @@ resource "aws_eks_cluster" "test_cluster" {
   vpc_config {
     subnet_ids              = local.eks_subnet_ids
     endpoint_private_access = true
-    endpoint_public_access  = true
-    public_access_cidrs     = ["0.0.0.0/0"]
   }
 
   enabled_cluster_log_types = ["api", "audit"]
