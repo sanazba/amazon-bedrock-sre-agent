@@ -123,19 +123,22 @@ resource "aws_iam_role_policy_attachment" "eks_container_registry_policy" {
   role       = aws_iam_role.eks_nodegroup_role.name
 }
 
-# Use your existing VPC configuration
+# Use default VPC if no specific VPC is configured
 data "aws_vpc" "selected" {
+  default = true
+}
+
+# Get subnets from the VPC
+data "aws_subnets" "selected" {
   filter {
-    name   = "tag:Name"
-    values = ["ets-dev-ci"]
+    name   = "vpc-id"
+    values = [data.aws_vpc.selected.id]
   }
 }
+
+# Use subnet IDs from data source
 locals {
-  eks_subnet_ids = [
-    "subnet-xXx",
-    "subnet-xXx", 
-    "subnet-xXx"
-  ]
+  eks_subnet_ids = data.aws_subnets.selected.ids
 }
 
 # EKS Cluster
@@ -147,6 +150,8 @@ resource "aws_eks_cluster" "test_cluster" {
   vpc_config {
     subnet_ids              = local.eks_subnet_ids
     endpoint_private_access = true
+    endpoint_public_access  = true
+    public_access_cidrs     = ["0.0.0.0/0"]
   }
 
   enabled_cluster_log_types = ["api", "audit"]
@@ -435,6 +440,133 @@ resource "aws_lambda_permission" "allow_bedrock" {
   function_name = aws_lambda_function.k8s_tools.function_name
   principal     = "bedrock.amazonaws.com"
   source_arn    = "arn:aws:bedrock:${local.region}:${local.account_id}:agent/*"
+}
+
+# =============================================================================
+# AUTOMATED TOKEN REFRESH SYSTEM
+# =============================================================================
+
+# Create ZIP file for token refresher Lambda
+data "archive_file" "token_refresher_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/token_refresher"
+  output_path = "${path.module}/token_refresher.zip"
+}
+
+# IAM role for token refresher Lambda
+resource "aws_iam_role" "token_refresher_role" {
+  name = "${var.project_name}-token-refresher-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = local.common_tags
+}
+
+# Basic Lambda execution policy for token refresher
+resource "aws_iam_role_policy_attachment" "token_refresher_basic_execution" {
+  role       = aws_iam_role.token_refresher_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# Custom policy for token refresher
+resource "aws_iam_role_policy" "token_refresher_policy" {
+  name = "${var.project_name}-token-refresher-policy"
+  role = aws_iam_role.token_refresher_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "eks:DescribeCluster",
+          "lambda:UpdateFunctionConfiguration",
+          "lambda:GetFunctionConfiguration"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "sts:GetCallerIdentity"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# CloudWatch Log Group for token refresher
+resource "aws_cloudwatch_log_group" "token_refresher_logs" {
+  name              = "/aws/lambda/${var.project_name}-token-refresher"
+  retention_in_days = 14
+  tags              = local.common_tags
+}
+
+# Token refresher Lambda function
+resource "aws_lambda_function" "token_refresher" {
+  filename         = data.archive_file.token_refresher_zip.output_path
+  function_name    = "${var.project_name}-token-refresher"
+  role            = aws_iam_role.token_refresher_role.arn
+  handler         = "token_refresher.lambda_handler"
+  runtime         = "python3.11"
+  timeout         = 60
+  memory_size     = 256
+  source_code_hash = data.archive_file.token_refresher_zip.output_base64sha256
+
+  description = "Automatically refresh Kubernetes service account tokens"
+
+  environment {
+    variables = {
+      TARGET_LAMBDA_FUNCTION = aws_lambda_function.k8s_tools.function_name
+      CLUSTER_NAME          = aws_eks_cluster.test_cluster.name
+      LOG_LEVEL            = "INFO"
+    }
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.token_refresher_basic_execution,
+    aws_cloudwatch_log_group.token_refresher_logs,
+    kubernetes_secret.bedrock_agent_token
+  ]
+
+  tags = local.common_tags
+}
+
+# EventBridge rule to trigger token refresh every hour
+resource "aws_cloudwatch_event_rule" "token_refresh_schedule" {
+  name                = "${var.project_name}-token-refresh"
+  description         = "Trigger token refresh every hour"
+  schedule_expression = "rate(1 hour)"
+
+  tags = local.common_tags
+}
+
+# EventBridge target
+resource "aws_cloudwatch_event_target" "token_refresh_target" {
+  rule      = aws_cloudwatch_event_rule.token_refresh_schedule.name
+  target_id = "TokenRefreshTarget"
+  arn       = aws_lambda_function.token_refresher.arn
+}
+
+# Permission for EventBridge to invoke token refresher Lambda
+resource "aws_lambda_permission" "allow_eventbridge_token_refresh" {
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.token_refresher.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.token_refresh_schedule.arn
 }
 
 # Bedrock Agent
