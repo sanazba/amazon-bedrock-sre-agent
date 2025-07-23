@@ -132,7 +132,6 @@ data "aws_vpc" "selected" {
 }
 
 # Use the exact subnet IDs that your existing cluster is using
-# (Auto-assign public IP was enabled manually via CLI)
 locals {
   eks_subnet_ids = [
     "subnet-03f452bb6f81bbe9c",
@@ -151,7 +150,7 @@ resource "aws_eks_cluster" "test_cluster" {
     subnet_ids              = local.eks_subnet_ids
     endpoint_private_access = true
     endpoint_public_access  = true
-    public_access_cidrs     = ["0.0.0.0/0"]  # Open for testing - secure after validation
+    public_access_cidrs     = ["0.0.0.0/0"]
   }
 
   enabled_cluster_log_types = ["api", "audit"]
@@ -165,27 +164,24 @@ resource "aws_eks_cluster" "test_cluster" {
   })
 }
 
-# EKS Node Group - created via CLI, managed by Terraform
+# EKS Node Group
 resource "aws_eks_node_group" "test_nodes" {
   cluster_name    = aws_eks_cluster.test_cluster.name
   node_group_name = "test"
   node_role_arn   = aws_iam_role.eks_nodegroup_role.arn
   subnet_ids      = local.eks_subnet_ids
 
-  # Instance configuration - matching your CLI command
   instance_types = ["t3.medium"]
   ami_type       = "AL2023_x86_64_STANDARD"
   capacity_type  = "ON_DEMAND"
   disk_size      = 20
 
-  # Scaling configuration - matching your CLI command  
   scaling_config {
     desired_size = 2
     max_size     = 3
     min_size     = 1
   }
 
-  # Update configuration
   update_config {
     max_unavailable = 1
   }
@@ -201,7 +197,6 @@ resource "aws_eks_node_group" "test_nodes" {
     NodeGroup = "test"
   })
   
-  # Lifecycle management since node group was created via CLI
   lifecycle {
     ignore_changes = [
       scaling_config[0].desired_size
@@ -209,24 +204,68 @@ resource "aws_eks_node_group" "test_nodes" {
   }
 }
 
-# Use existing service account created manually (import into state)
-data "kubernetes_service_account" "bedrock_agent" {
+# Create service account for Bedrock Agent
+resource "kubernetes_service_account" "bedrock_agent" {
   metadata {
     name      = "bedrock-agent"
     namespace = "kube-system"
   }
+
+  depends_on = [aws_eks_node_group.test_nodes]
 }
 
-# Use existing secret created manually (import into state)
-data "kubernetes_secret" "bedrock_agent_token" {
+# Create cluster role binding for the service account
+resource "kubernetes_cluster_role_binding" "bedrock_agent" {
+  metadata {
+    name = "bedrock-agent-binding"
+  }
+
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = "cluster-admin"
+  }
+
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account.bedrock_agent.metadata[0].name
+    namespace = kubernetes_service_account.bedrock_agent.metadata[0].namespace
+  }
+
+  depends_on = [kubernetes_service_account.bedrock_agent]
+}
+
+# Create secret for the service account token
+resource "kubernetes_secret" "bedrock_agent_token" {
   metadata {
     name      = "bedrock-agent-token"
     namespace = "kube-system"
+    annotations = {
+      "kubernetes.io/service-account.name" = kubernetes_service_account.bedrock_agent.metadata[0].name
+    }
   }
+
+  type = "kubernetes.io/service-account-token"
+
+  depends_on = [kubernetes_service_account.bedrock_agent]
 }
 
-# Skip test deployments for now - focus on getting API access working
-# Can add these back once the cluster is fully operational
+# Data sources to read the created resources
+data "kubernetes_service_account" "bedrock_agent" {
+  metadata {
+    name      = kubernetes_service_account.bedrock_agent.metadata[0].name
+    namespace = kubernetes_service_account.bedrock_agent.metadata[0].namespace
+  }
+  depends_on = [kubernetes_service_account.bedrock_agent]
+}
+
+data "kubernetes_secret" "bedrock_agent_token" {
+  metadata {
+    name      = kubernetes_secret.bedrock_agent_token.metadata[0].name
+    namespace = kubernetes_secret.bedrock_agent_token.metadata[0].namespace
+  }
+  depends_on = [kubernetes_secret.bedrock_agent_token]
+}
 
 # =============================================================================
 # BEDROCK AGENT SETUP
@@ -548,7 +587,7 @@ resource "aws_bedrockagent_agent_action_group" "k8s_tools" {
         }
         "/analyze-namespace" = {
           post = {
-            summary     = "Analyze namespace"
+            summary     = "Describe namespace"
             description = "Analyze a specific namespace"
             operationId = "analyzeNamespace"
             requestBody = {
@@ -598,33 +637,4 @@ resource "aws_bedrockagent_agent_alias" "sre_agent_alias" {
   description      = "Production alias for SRE Agent"
 
   tags = local.common_tags
-}
-
-# =============================================================================
-# OUTPUTS
-# =============================================================================
-
-output "eks_cluster_name" {
-  description = "Name of the EKS cluster"
-  value       = aws_eks_cluster.test_cluster.name
-}
-
-output "eks_cluster_endpoint" {
-  description = "Endpoint of the EKS cluster"
-  value       = aws_eks_cluster.test_cluster.endpoint
-}
-
-output "bedrock_agent_id" {
-  description = "ID of the Bedrock Agent"
-  value       = aws_bedrockagent_agent.sre_agent.agent_id
-}
-
-output "lambda_function_name" {
-  description = "Name of the Lambda function"
-  value       = aws_lambda_function.k8s_tools.function_name
-}
-
-output "kubectl_config_command" {
-  description = "Command to configure kubectl"
-  value       = "aws eks update-kubeconfig --region ${local.region} --name ${aws_eks_cluster.test_cluster.name}"
 }

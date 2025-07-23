@@ -2,12 +2,9 @@ import json
 import logging
 import os
 import boto3
-import requests
-from datetime import datetime
 import urllib3
-
-# Suppress SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import ssl
+from datetime import datetime
 
 # Set up logging
 logger = logging.getLogger()
@@ -60,15 +57,16 @@ def lambda_handler(event, context):
         elif api_path == '/get-cluster-health':
             logger.info(f"Calling get_cluster_data_with_real_kubernetes_api for path: {api_path}")
             result = get_cluster_data_with_real_kubernetes_api(clusters)
-        elif api_path == '/create-pod':
-            name = parameters.get('name', 'test-pod')
-            image = parameters.get('image', 'nginx')
+        elif api_path == '/check-nodes':
+            result = check_nodes(clusters)
+        elif api_path == '/describe-pod':
+            pod_name = parameters.get('pod_name', '')
             namespace = parameters.get('namespace', 'default')
-            result = create_pod_in_cluster(clusters, name, image, namespace)
+            result = describe_pod(clusters, pod_name, namespace)
         else:
             result = {
                 'error': f'Unknown API path: {api_path}',
-                'available_paths': ['/get-pods', '/analyze-namespace', '/get-cluster-health', '/create-pod']
+                'available_paths': ['/get-pods', '/analyze-namespace', '/get-cluster-health', '/check-nodes', '/describe-pod']
             }
         
         logger.info(f"Function result keys: {list(result.keys())}")
@@ -134,6 +132,33 @@ def get_kubernetes_config(cluster_name):
         logger.error(f"Error getting Kubernetes config: {str(e)}")
         return None, None, None
 
+def make_k8s_request(url, token, method='GET', data=None):
+    """Make HTTP request to Kubernetes API using urllib3"""
+    try:
+        http = urllib3.PoolManager(cert_reqs='CERT_NONE', assert_hostname=False)
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+        
+        if method == 'GET':
+            response = http.request('GET', url, headers=headers, timeout=30)
+        elif method == 'POST':
+            response = http.request('POST', url, headers=headers, body=json.dumps(data), timeout=30)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        
+        if response.status == 200 or response.status == 201:
+            return json.loads(response.data.decode('utf-8'))
+        else:
+            logger.error(f"K8s API error: {response.status} - {response.data.decode('utf-8')}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error making K8s request: {str(e)}")
+        return None
+
 def get_pods_from_cluster(clusters, namespace=""):
     """Get pods from Kubernetes cluster using direct API calls"""
     try:
@@ -152,18 +177,9 @@ def get_pods_from_cluster(clusters, namespace=""):
             
             logger.info(f"Getting pods from: {api_url}")
             
-            # Make request to Kubernetes API
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Accept': 'application/json'
-            }
-            
-            response = requests.get(api_url, headers=headers, verify=False, timeout=30)
-            
-            if response.status_code == 200:
-                pods_data = response.json()
+            pods_data = make_k8s_request(api_url, token)
+            if pods_data:
                 pods = []
-                
                 for pod in pods_data.get('items', []):
                     pod_info = {
                         'name': pod['metadata']['name'],
@@ -173,10 +189,7 @@ def get_pods_from_cluster(clusters, namespace=""):
                         'created': pod['metadata']['creationTimestamp']
                     }
                     pods.append(pod_info)
-                
                 results.extend(pods)
-            else:
-                logger.error(f"Failed to get pods: {response.status_code} - {response.text}")
         
         return {
             'timestamp': datetime.utcnow().isoformat(),
@@ -210,18 +223,9 @@ def get_cluster_data_with_real_kubernetes_api(clusters, namespace=""):
             namespaces_url = f"{cluster_endpoint}/api/v1/namespaces"
             logger.info(f"Calling Kubernetes API: {namespaces_url}")
             
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Accept': 'application/json'
-            }
-            
-            response = requests.get(namespaces_url, headers=headers, verify=False, timeout=30)
-            logger.info(f"API response status: {response.status_code}")
-            
-            if response.status_code == 200:
-                namespaces_data = response.json()
+            namespaces_data = make_k8s_request(namespaces_url, token)
+            if namespaces_data:
                 namespaces = []
-                
                 for ns in namespaces_data.get('items', []):
                     ns_info = {
                         'name': ns['metadata']['name'],
@@ -258,8 +262,8 @@ def get_cluster_data_with_real_kubernetes_api(clusters, namespace=""):
             'summary': f"Error retrieving cluster data: {str(e)}"
         }
 
-def create_pod_in_cluster(clusters, pod_name, image, namespace="default"):
-    """Create a pod in the Kubernetes cluster"""
+def check_nodes(clusters):
+    """Check node health and status"""
     try:
         results = []
         
@@ -268,70 +272,23 @@ def create_pod_in_cluster(clusters, pod_name, image, namespace="default"):
             if not cluster_endpoint:
                 continue
             
-            # Build pod manifest
-            pod_manifest = {
-                'apiVersion': 'v1',
-                'kind': 'Pod',
-                'metadata': {
-                    'name': pod_name,
-                    'namespace': namespace,
-                    'labels': {
-                        'created-by': 'bedrock-agent',
-                        'app': pod_name
+            nodes_url = f"{cluster_endpoint}/api/v1/nodes"
+            logger.info(f"Getting nodes from: {nodes_url}")
+            
+            nodes_data = make_k8s_request(nodes_url, token)
+            if nodes_data:
+                nodes = []
+                for node in nodes_data.get('items', []):
+                    node_info = {
+                        'name': node['metadata']['name'],
+                        'status': 'Ready' if any(condition['type'] == 'Ready' and condition['status'] == 'True' 
+                                               for condition in node['status']['conditions']) else 'NotReady',
+                        'version': node['status']['nodeInfo']['kubeletVersion'],
+                        'instance_type': node['metadata']['labels'].get('node.kubernetes.io/instance-type', 'Unknown'),
+                        'created': node['metadata']['creationTimestamp']
                     }
-                },
-                'spec': {
-                    'containers': [
-                        {
-                            'name': pod_name,
-                            'image': image,
-                            'ports': [
-                                {
-                                    'containerPort': 80
-                                }
-                            ]
-                        }
-                    ],
-                    'restartPolicy': 'Always'
-                }
-            }
-            
-            # Create pod via API
-            api_url = f"{cluster_endpoint}/api/v1/namespaces/{namespace}/pods"
-            headers = {
-                'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-            
-            response = requests.post(
-                api_url, 
-                headers=headers, 
-                json=pod_manifest, 
-                verify=False, 
-                timeout=30
-            )
-            
-            if response.status_code in [200, 201]:
-                result = {
-                    'cluster': cluster_name,
-                    'pod_name': pod_name,
-                    'namespace': namespace,
-                    'image': image,
-                    'status': 'created',
-                    'message': f"Pod {pod_name} created successfully in namespace {namespace}"
-                }
-            else:
-                result = {
-                    'cluster': cluster_name,
-                    'pod_name': pod_name,
-                    'namespace': namespace,
-                    'image': image,
-                    'status': 'failed',
-                    'error': f"HTTP {response.status_code}: {response.text}"
-                }
-            
-            results.append(result)
+                    nodes.append(node_info)
+                results.extend(nodes)
         
         return {
             'timestamp': datetime.utcnow().isoformat(),
@@ -341,7 +298,58 @@ def create_pod_in_cluster(clusters, pod_name, image, namespace="default"):
         }
         
     except Exception as e:
-        logger.error(f"Error creating pod: {str(e)}")
+        logger.error(f"Error checking nodes: {str(e)}")
+        return {
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat(),
+            'clusters_checked': clusters,
+            'data_source': 'kubernetes_api'
+        }
+
+def describe_pod(clusters, pod_name, namespace="default"):
+    """Get detailed pod information"""
+    try:
+        results = []
+        
+        for cluster_name in clusters:
+            cluster_endpoint, cluster_ca, token = get_kubernetes_config(cluster_name)
+            if not cluster_endpoint:
+                continue
+            
+            pod_url = f"{cluster_endpoint}/api/v1/namespaces/{namespace}/pods/{pod_name}"
+            logger.info(f"Describing pod: {pod_url}")
+            
+            pod_data = make_k8s_request(pod_url, token)
+            if pod_data:
+                pod_info = {
+                    'name': pod_data['metadata']['name'],
+                    'namespace': pod_data['metadata']['namespace'],
+                    'status': pod_data['status']['phase'],
+                    'node': pod_data['spec'].get('nodeName', 'Unknown'),
+                    'created': pod_data['metadata']['creationTimestamp'],
+                    'containers': [],
+                    'conditions': pod_data['status'].get('conditions', [])
+                }
+                
+                for container in pod_data['spec']['containers']:
+                    container_info = {
+                        'name': container['name'],
+                        'image': container['image'],
+                        'ports': container.get('ports', [])
+                    }
+                    pod_info['containers'].append(container_info)
+                
+                results.append(pod_info)
+        
+        return {
+            'timestamp': datetime.utcnow().isoformat(),
+            'clusters_checked': clusters,
+            'data_source': 'kubernetes_api',
+            'results': results
+        }
+        
+    except Exception as e:
+        logger.error(f"Error describing pod: {str(e)}")
         return {
             'error': str(e),
             'timestamp': datetime.utcnow().isoformat(),
